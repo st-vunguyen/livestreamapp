@@ -9,6 +9,7 @@ import android.media.*
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -39,20 +40,114 @@ class RootEncoderService(
     companion object {
         private const val TAG = "RootEncoder"
         
-        // Fixed MVP presets
-        private const val VIDEO_WIDTH = 1280
-        private const val VIDEO_HEIGHT = 720
-        private const val VIDEO_FPS = 60
-        private const val VIDEO_BITRATE = 6_000_000  // 6 Mbps (YouTube recommended 4.5-7.5 Mbps for 720p60)
-        private const val VIDEO_IFRAME_INTERVAL = 2  // 2 seconds (GOP = 120 frames @ 60fps)
+        // [ADAPTIVE] Encoder profile data class
+        data class EncProfile(
+            val width: Int,
+            val height: Int,
+            val fps: Int,
+            val bitrate: Int,      // bps
+            val avcLevel: Int      // MediaCodecInfo.CodecProfileLevel.*
+        )
         
-        // Audio: 48kHz Stereo 160kbps (hardware native, no resample)
+        // [ADAPTIVE] Scale mode for encoder
+        enum class ScaleMode {
+            FIT,        // Giữ tỉ lệ máy, không crop (nét nhất, YouTube letterbox)
+            FILL_16_9   // Ép về 16:9, crop nhẹ (không viền player)
+        }
+        
+        // Audio: 48kHz Stereo 128kbps (YouTube recommended for standard quality)
         private const val AUDIO_SAMPLE_RATE = 48000  // 48kHz (hardware std)
-        private const val AUDIO_BITRATE = 160_000    // 160 kbps AAC-LC
+        private const val AUDIO_BITRATE = 128_000    // 128 kbps AAC-LC (YouTube standard)
         private const val AUDIO_CHANNELS = 2         // Stereo
         private const val AUDIO_CHANNEL_MASK = AudioFormat.CHANNEL_IN_STEREO
         
         const val REQUEST_CODE_PROJECTION = 1001
+        
+        // [ADAPTIVE] Align to multiple of 2/16 for encoder compatibility
+        private fun align(v: Int, mult: Int = 2): Int = (v / mult) * mult
+        
+        /**
+         * [ADAPTIVE] Get native screen size in landscape orientation
+         * Works on API 30+ and older devices
+         */
+        private fun getNativeLandscapeSize(ctx: Context): Pair<Int, Int> {
+            return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val wm = ctx.getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
+                val bounds = wm.currentWindowMetrics.bounds
+                val w = bounds.width()
+                val h = bounds.height()
+                if (w >= h) w to h else h to w  // Landscape
+            } else {
+                @Suppress("DEPRECATION")
+                val dm = ctx.resources.displayMetrics
+                val w = dm.widthPixels
+                val h = dm.heightPixels
+                if (w >= h) w to h else h to w  // Landscape
+            }
+        }
+        
+        /**
+         * [ADAPTIVE] Compute encoder size based on native screen + mode
+         * @param nativeW Native width (landscape)
+         * @param nativeH Native height (landscape)
+         * @param maxShortEdge Maximum short edge (default 1080p)
+         * @param mode FIT (keep aspect) or FILL_16_9 (force 16:9)
+         * @return Pair of (encoderWidth, encoderHeight)
+         */
+        private fun computeEncoderSize(
+            nativeW: Int,
+            nativeH: Int,
+            maxShortEdge: Int = 1080,
+            mode: ScaleMode = ScaleMode.FIT
+        ): Pair<Int, Int> {
+            val aspectRatio = nativeW.toFloat() / nativeH.toFloat()  // Landscape aspect
+            
+            return when (mode) {
+                ScaleMode.FIT -> {
+                    // Keep native aspect ratio, scale down to maxShortEdge
+                    val targetH = kotlin.math.min(nativeH, maxShortEdge)
+                    val targetW = (targetH * aspectRatio).toInt()
+                    align(targetW, 2) to align(targetH, 2)
+                }
+                ScaleMode.FILL_16_9 -> {
+                    // Force 16:9 aspect ratio (crop if needed)
+                    val targetAR = 16f / 9f
+                    val baseH = kotlin.math.min(nativeH, maxShortEdge)
+                    val baseW = (baseH * targetAR).toInt()
+                    align(baseW, 2) to align(baseH, 2)
+                }
+            }
+        }
+        
+        /**
+         * [ADAPTIVE] Suggest bitrate based on resolution and FPS
+         * Following YouTube recommended upload encoding settings
+         */
+        private fun suggestBitrate(width: Int, height: Int, fps: Int): Int {
+            val shortEdge = minOf(width, height)
+            return when {
+                shortEdge >= 1440 -> if (fps > 30) 20_000_000 else 16_000_000  // 1440p
+                shortEdge >= 1080 -> if (fps > 30) 12_000_000 else 9_000_000   // 1080p
+                shortEdge >= 720  -> if (fps > 30) 6_000_000 else 4_500_000    // 720p
+                else              -> if (fps > 30) 3_000_000 else 2_000_000    // 540p-
+            }
+        }
+        
+        /**
+         * [ADAPTIVE] Select AVC Level based on resolution and FPS
+         */
+        private fun avcLevelFor(width: Int, height: Int, fps: Int): Int {
+            val pixelsPerSec = width * height * fps
+            return when {
+                // 1080p60 ~ 124M px/s → Level 5
+                pixelsPerSec > 118_800_000 -> MediaCodecInfo.CodecProfileLevel.AVCLevel5
+                // 1080p30 or 720p60 → Level 4.2
+                fps > 30 || width >= 1920 || height >= 1080 ->
+                    MediaCodecInfo.CodecProfileLevel.AVCLevel42
+                // 720p30 and below → Level 4
+                else -> MediaCodecInfo.CodecProfileLevel.AVCLevel4
+            }
+        }
     }
     
     // MethodChannel for callbacks to Flutter
@@ -63,9 +158,32 @@ class RootEncoderService(
         Log.i(TAG, "[PTL] MethodChannel registered in RootEncoderService")
     }
     
+    // [CRASH-RECOVERY] Mark flags when stream starts
+    private fun markStartFlags() {
+        prefs.manualStop = false
+        prefs.wasStreaming = true
+        PtlLogger.i(TAG, "[RECOVERY] Flags set: manualStop=false, wasStreaming=true")
+    }
+    
+    // [CRASH-RECOVERY] Mark flags when stream stops
+    private fun markStopFlags(manual: Boolean) {
+        prefs.manualStop = manual
+        if (manual) {
+            // User stopped → clear wasStreaming so we don't auto-restart
+            prefs.wasStreaming = false
+            PtlLogger.i(TAG, "[RECOVERY] Manual stop: wasStreaming=false")
+        } else {
+            // Crash/reconnect-failed → keep wasStreaming=true for auto-restart
+            PtlLogger.i(TAG, "[RECOVERY] Non-manual stop: wasStreaming kept true")
+        }
+    }
+    
     // Public method for overlay to stop stream
     fun stopFromOverlay(result: MethodChannel.Result) {
         Log.i(TAG, "[PTL] stopFromOverlay() called")
+        PtlLogger.i(TAG, "[FIX] User clicked STOP in overlay - setting manualStop=true")
+        manualStop = true  // [FIX-CRITICAL] User explicitly stopped - don't reconnect
+        markStopFlags(manual = true)  // [CRASH-RECOVERY] Persist flags
         stop(result)
     }
     
@@ -74,8 +192,8 @@ class RootEncoderService(
     private var virtualDisplay: VirtualDisplay? = null
     private var videoEncoder: MediaCodec? = null
     
-    // Audio capture manager (mic + internal) - internal for overlay access
-    internal var audioCaptureManager: AudioCaptureManager? = null
+    // [V2] CleanAudioMixer with drift correction, HPF, soft-limiter
+    private var cleanAudioMixer: CleanAudioMixer? = null
     
     private var flvMuxer: MinimalFlvMuxer? = null
     private var rtmpsClient: com.screenlive.app.rtmp.MinimalRtmpsClient? = null
@@ -87,6 +205,16 @@ class RootEncoderService(
     private var reconnectJob: Job? = null  // [FIX] Track reconnect coroutine to cancel on manual stop
 
     @Volatile private var rtmpsDisconnectHandled = false
+    
+    // [FIX-CRITICAL] Track whether user explicitly stopped (vs network/crash auto-stop)
+    // This prevents reconnect when user clicks STOP, but allows reconnect on network issues
+    @Volatile private var manualStop = false
+    
+    // [CRASH-RECOVERY] Prefs helper for persistent state (manualStop + wasStreaming)
+    private lateinit var prefs: Prefs
+    
+    // [ADAPTIVE] Computed encoder profile (set during initialization)
+    private lateinit var encoderProfile: EncProfile
     
     private var pendingResult: MethodChannel.Result? = null
     private var pendingRtmpsUrl: String? = null
@@ -110,6 +238,9 @@ class RootEncoderService(
     private var overlayStopReceiver: android.content.BroadcastReceiver? = null
     
     init {
+        // [CRASH-RECOVERY] Initialize Prefs helper for state persistence
+        prefs = Prefs(activity)
+        
         // Register receiver for overlay stop requests
         overlayStopReceiver = object : android.content.BroadcastReceiver() {
             override fun onReceive(context: android.content.Context?, intent: android.content.Intent?) {
@@ -172,21 +303,27 @@ class RootEncoderService(
         cleanup()
     }
     
-    // [PTL] Audio control methods for overlay
+    // [V2] Audio control methods for overlay (using CleanAudioMixer)
     fun toggleMic(): Boolean {
-        val result = audioCaptureManager?.toggleMic() ?: false
-        Log.i(TAG, "[PTL] RootEncoderService.toggleMic() -> $result")
-        return result
+        cleanAudioMixer?.let {
+            it.micEnabled = !it.micEnabled
+            Log.i(TAG, "[V2] toggleMic() -> ${it.micEnabled}")
+            return it.micEnabled
+        }
+        return false
     }
     
     fun toggleGameAudio(): Boolean {
-        val result = audioCaptureManager?.toggleGameAudio() ?: false
-        Log.i(TAG, "[PTL] RootEncoderService.toggleGameAudio() -> $result")
-        return result
+        cleanAudioMixer?.let {
+            it.gameEnabled = !it.gameEnabled
+            Log.i(TAG, "[V2] toggleGameAudio() -> ${it.gameEnabled}")
+            return it.gameEnabled
+        }
+        return false
     }
     
-    fun isMicEnabled(): Boolean = audioCaptureManager?.isMicEnabled ?: true
-    fun isGameAudioEnabled(): Boolean = audioCaptureManager?.isGameAudioEnabled ?: true
+    fun isMicEnabled(): Boolean = cleanAudioMixer?.micEnabled ?: true
+    fun isGameAudioEnabled(): Boolean = cleanAudioMixer?.gameEnabled ?: true
     
     private fun start(call: MethodCall, result: MethodChannel.Result) {
         try {
@@ -206,13 +343,14 @@ class RootEncoderService(
             Log.i(TAG, "=== STARTING ROOTENCODER STREAM ===")
             Log.i(TAG, "URL: $rtmpsUrl")
             Log.i(TAG, "Key: ***${streamKey.takeLast(4)}")
-            Log.i(TAG, "Preset: ${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}fps, ${VIDEO_BITRATE/1_000_000}Mbps")
             
             // PTL: Use centralized logger
             PtlLogger.i(TAG, "=== STARTING ROOTENCODER STREAM ===")
             PtlLogger.i(TAG, "URL: $rtmpsUrl")
             PtlLogger.i(TAG, "Key: $streamKey")  // Auto-masked by PtlLogger
-            PtlLogger.i(TAG, "Preset: ${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}fps, ${VIDEO_BITRATE/1_000_000}Mbps")
+            
+            // [CRASH-RECOVERY] Mark stream start flags for auto-restart on crash
+            markStartFlags()
             
             // Store for after projection grant
             pendingResult = result
@@ -432,9 +570,10 @@ class RootEncoderService(
         try {
             com.screenlive.app.rtmp.PtlLog.i("[PTL] PUBLISH ACK – starting encoder pipeline")
             PtlLogger.i(TAG, "[PTL] PUBLISH ACK – starting encoder pipeline")
+            PtlLogger.i(TAG, "[PTL] onPublishConfirmed: manualStop=$manualStop isStreaming=$isStreaming isEncoding=$isEncoding")
             
             // Ensure encoders are ready
-            if (videoEncoder == null || audioCaptureManager == null) {
+            if (videoEncoder == null || cleanAudioMixer == null) {
                 PtlLogger.e(TAG, "❌ Encoders not initialized!")
                 withContext(Dispatchers.Main) {
                     pendingResult?.error("ENCODER_ERROR", "Encoders not initialized", null)
@@ -445,10 +584,10 @@ class RootEncoderService(
             
             // Send @setDataFrame("onMetaData") BEFORE first frames
             client.sendMetadata(
-                width = VIDEO_WIDTH,
-                height = VIDEO_HEIGHT,
-                fps = VIDEO_FPS,
-                videoBitrate = VIDEO_BITRATE,
+                width = encoderProfile.width,
+                height = encoderProfile.height,
+                fps = encoderProfile.fps,
+                videoBitrate = encoderProfile.bitrate,
                 audioBitrate = AUDIO_BITRATE
             )
             
@@ -529,36 +668,101 @@ class RootEncoderService(
     
     private fun stop(result: MethodChannel.Result) {
         Log.i(TAG, "Stopping stream...")
-        cleanup()
+        PtlLogger.i(TAG, "[FIX] stop() called - setting manualStop=true")
+        manualStop = true  // [FIX-CRITICAL] User explicitly stopped - don't reconnect
+        markStopFlags(manual = true)  // [CRASH-RECOVERY] Persist flags
+        cleanup("manual stop")
         result.success(mapOf("ok" to true))
     }
 
     // ==================== Initialization ====================
     
     private fun initializeVideoEncoder() {
-        Log.d(TAG, "Initializing video encoder...")
+        Log.d(TAG, "[ADAPTIVE] Initializing video encoder with auto-profile...")
         
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, VIDEO_WIDTH, VIDEO_HEIGHT).apply {
+        // 1) Get native screen size in landscape orientation
+        val (nativeW, nativeH) = getNativeLandscapeSize(activity)
+        Log.i(TAG, "[ADAPTIVE] Native screen: ${nativeW}x${nativeH} (${String.format("%.2f", nativeW.toFloat()/nativeH)}:1)")
+        
+        // 2) Choose scale mode: FIT (keep aspect, no crop) or FILL_16_9 (force 16:9, may crop)
+        val scaleMode = ScaleMode.FIT  // TODO: Make configurable via SharedPreferences
+        
+        // 3) Compute encoder size (limit to 1080p short edge)
+        val (encW, encH) = computeEncoderSize(nativeW, nativeH, maxShortEdge = 1080, mode = scaleMode)
+        
+        // 4) FPS: 30 (safe for YouTube, no "framerate too high" warning)
+        // TODO: Make configurable (30/60) based on network bandwidth test
+        val fps = 30
+        
+        // 5) Bitrate: YouTube recommended for resolution + FPS
+        val bitrate = suggestBitrate(encW, encH, fps)
+        
+        // 6) AVC Level: Based on resolution + FPS
+        val avcLevel = avcLevelFor(encW, encH, fps)
+        
+        // Store profile for later use (overlay metrics, reconnect, etc.)
+        encoderProfile = EncProfile(encW, encH, fps, bitrate, avcLevel)
+        
+        Log.i(TAG, "[ADAPTIVE] Encoder profile → ${encW}x${encH}@${fps}fps, ${bitrate/1_000_000}Mbps, level=$avcLevel, mode=$scaleMode")
+        PtlLogger.i(TAG, "[ADAPTIVE] Profile: ${encW}x${encH}@${fps}fps, ${bitrate/1_000_000}Mbps")
+        
+        // 7) Create MediaFormat with computed settings
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, encW, encH).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, VIDEO_BITRATE)
-            setInteger(MediaFormat.KEY_FRAME_RATE, VIDEO_FPS)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, VIDEO_IFRAME_INTERVAL)
+            setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)  // 2s GOP
+            
+            // CBR for consistent quality on YouTube
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+            
+            // Profile: High, Level: Computed dynamically
+            setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
+            setInteger(MediaFormat.KEY_LEVEL, avcLevel)
+            
+            // Color metadata (Android 7+)
+            if (Build.VERSION.SDK_INT >= 24) {
+                setInteger(MediaFormat.KEY_COLOR_STANDARD, 1)  // BT.709
+                setInteger(MediaFormat.KEY_COLOR_RANGE, 2)     // FULL
+            }
+            
+            // [V2] Real-time encoder optimizations (API 23+)
+            if (Build.VERSION.SDK_INT >= 23) {
+                // Operating rate: 2x FPS to handle game 90/120fps without "hụt hơi"
+                setInteger(MediaFormat.KEY_OPERATING_RATE, fps * 2)
+                Log.i(TAG, "[V2] Operating rate: ${fps * 2} (2x FPS)")
+                
+                // Priority 0 = real-time (minimize latency)
+                setInteger(MediaFormat.KEY_PRIORITY, 0)
+                Log.i(TAG, "[V2] Encoder priority: 0 (real-time)")
+            }
         }
         
         videoEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
             configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         }
         
-        // Create VirtualDisplay
+        // Create input surface
         val surface = videoEncoder!!.createInputSurface()
-        val metrics = activity.resources.displayMetrics
+        
+        // Lock surface frame rate to computed FPS (Android 11+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                surface.setFrameRate(fps.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+                Log.i(TAG, "[ADAPTIVE] ✓ Surface frame rate locked to ${fps}fps")
+            } catch (e: Exception) {
+                Log.w(TAG, "[ADAPTIVE] Cannot set surface frame rate: ${e.message}")
+            }
+        }
+        
+        // 8) Create VirtualDisplay with encoder size (no scaling)
+        val dpi = activity.resources.displayMetrics.densityDpi
         
         virtualDisplay = mediaProjection?.createVirtualDisplay(
             "ScreenLive",
-            VIDEO_WIDTH,
-            VIDEO_HEIGHT,
-            metrics.densityDpi,
+            encW,
+            encH,
+            dpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             surface,
             null,
@@ -566,22 +770,37 @@ class RootEncoderService(
         )
         
         videoEncoder!!.start()
-        Log.i(TAG, "✓ Video encoder started")
+        Log.i(TAG, "[ADAPTIVE] ✓ Video encoder started (${encW}x${encH}@${fps}fps)")
     }
     
     private fun initializeAudioEncoder() {
-        Log.d(TAG, "Initializing audio encoder (48kHz stereo AAC-LC 160kbps)...")
+        Log.d(TAG, "[V2] Initializing CleanAudioMixer (48kHz stereo AAC-LC 160kbps)...")
         
-        // Use AudioCaptureManager for mic + internal audio (pass activity context)
-        audioCaptureManager = AudioCaptureManager(activity, mediaProjection)
+        // [V2] Use CleanAudioMixer with drift correction, HPF, soft-limiter
+        cleanAudioMixer = CleanAudioMixer(mediaProjection)
+        cleanAudioMixer!!.init()
         
-        if (!audioCaptureManager!!.initialize()) {
-            throw IOException("Failed to initialize audio capture")
+        // Start mixing with callback for AAC frames
+        cleanAudioMixer!!.start { data, isConfig ->
+            if (isConfig) {
+                // AudioSpecificConfig - send once before first frame
+                val tag = flvMuxer?.createAudioConfigTag(data, 0)
+                if (tag != null) {
+                    rtmpsClient?.sendFlvData(com.screenlive.app.rtmp.RtmpConsts.AUDIO_MESSAGE, tag)
+                    Log.d(TAG, "[V2] ✓ AudioSpecificConfig sent (${data.size} bytes)")
+                }
+            } else {
+                // Regular AAC frame
+                val ts = ((System.currentTimeMillis() - streamStartTime)).toInt()
+                val tag = flvMuxer?.createAudioTag(data, ts)
+                if (tag != null) {
+                    rtmpsClient?.sendFlvData(com.screenlive.app.rtmp.RtmpConsts.AUDIO_MESSAGE, tag, ts)
+                }
+            }
         }
         
-        audioCaptureManager!!.start()
-        
-        Log.i(TAG, "✓ Audio capture started (mic + internal if Android 10+)")
+        Log.i(TAG, "[V2] ✓ CleanAudioMixer started (no-AGC, HPF, limiter, drift-PLL)")
+        PtlLogger.i(TAG, "[V2] Audio: drift-corrected, 30Hz HPF, smooth limiter")
     }
     
     private fun initializeFlvMuxer() {
@@ -598,9 +817,9 @@ class RootEncoderService(
                 // Send FLV header + metadata
                 sendFlvHeader()
                 
-                // Parallel encoding
+                // [V2] Only video loop - audio handled by CleanAudioMixer callback
                 launch { encodeVideoLoop() }
-                launch { encodeAudioLoop() }
+                // Audio frames sent via CleanAudioMixer callback in initializeAudioEncoder()
                 
             } catch (e: Exception) {
                 Log.e(TAG, "Encoding error", e)
@@ -610,12 +829,47 @@ class RootEncoderService(
     }
     
     private fun sendFlvHeader() {
-        // [PTL FIX] For RTMP streaming, we DON'T send FLV file header or metadata
-        // RTMP expects direct video/audio messages after publish
-        // The metadata is optional and YouTube doesn't require it
+        // [FIX] Send metadata to YouTube with correct framerate=30
+        // YouTube uses this to validate stream settings
+        try {
+            rtmpsClient?.sendMetadata(
+                width = encoderProfile.width,
+                height = encoderProfile.height,
+                fps = encoderProfile.fps,  // [FIX] Will be 30fps now
+                videoBitrate = encoderProfile.bitrate,
+                audioBitrate = AUDIO_BITRATE
+            )
+            Log.i(TAG, "[FIX] ✓ Metadata sent: ${encoderProfile.width}x${encoderProfile.height}@${encoderProfile.fps}fps, video=${encoderProfile.bitrate/1_000_000}Mbps, audio=${AUDIO_BITRATE/1000}kbps")
+            PtlLogger.i(TAG, "Metadata: ${encoderProfile.width}x${encoderProfile.height}@${encoderProfile.fps}fps, ${encoderProfile.bitrate/1_000_000}Mbps")
+        } catch (e: Exception) {
+            Log.w(TAG, "[FIX] Failed to send metadata: ${e.message}")
+            // Non-critical - continue streaming
+        }
         
-        PtlLogger.i(TAG, "RTMP ready - no metadata needed for YouTube")
         Log.d(TAG, "✓ RTMP ready for video/audio packets")
+    }
+    
+    /**
+     * [V2] Adapt bitrate dynamically based on network conditions
+     * Call this periodically (every 2-3s) based on throughput monitoring
+     * @param targetKbps Target bitrate in kilobits per second
+     */
+    fun adaptBitrate(targetKbps: Int) {
+        try {
+            val targetBps = targetKbps * 1000
+            val params = Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, targetBps)
+            }
+            videoEncoder?.setParameters(params)
+            
+            // Update stored profile
+            encoderProfile = encoderProfile.copy(bitrate = targetBps)
+            
+            Log.i(TAG, "[V2] ✓ Bitrate adapted → ${targetKbps}kbps (${targetBps/1_000_000}Mbps)")
+            PtlLogger.i(TAG, "Bitrate: ${targetKbps}kbps")
+        } catch (e: Exception) {
+            Log.w(TAG, "[V2] Failed to adapt bitrate: ${e.message}")
+        }
     }
     
     private fun encodeVideoLoop() {
@@ -696,65 +950,9 @@ class RootEncoderService(
         PtlLogger.i(TAG, "Video encoding loop stopped (frames=$frameCount, keyframes=$keyframeCount)")
     }
     
-    private fun encodeAudioLoop() {
-        var startTime = System.currentTimeMillis()
-        var audioFrameCount = 0
-        
-        PtlLogger.i(TAG, "Audio encoding loop started (48kHz stereo AAC-LC 160kbps)")
-        
-        while (isStreaming) {
-            try {
-                // Capture and encode one frame (mic + internal mixed)
-                val frame = audioCaptureManager?.captureAndEncode()
-                
-                if (frame == null) {
-                    Thread.sleep(5) // Small delay if no data
-                    continue
-                }
-                
-                // Handle ASC (AudioSpecificConfig) - send once before first frame
-                if (frame.isConfig && !audioConfigSent) {
-                    val configTag = flvMuxer?.createAudioConfigTag(frame.data, 0)
-                    if (configTag != null) {
-                        rtmpsClient?.sendFlvData(com.screenlive.app.rtmp.RtmpConsts.AUDIO_MESSAGE, configTag)
-                        totalBytesSent += configTag.size
-                        audioConfigSent = true
-                        PtlLogger.i(TAG, "✓ Sent ASC (AudioSpecificConfig) ${frame.data.size}B → totalSent=$totalBytesSent")
-                    } else {
-                        PtlLogger.w(TAG, "⚠️ Failed to create audio config FLV tag!")
-                    }
-                    continue
-                }
-                
-                // Handle regular AAC frames
-                if (!frame.isConfig && frame.data.isNotEmpty()) {
-                    val timestamp = (System.currentTimeMillis() - startTime).toInt()
-                    val flvTag = flvMuxer?.createAudioTag(frame.data, timestamp)
-                    if (flvTag != null) {
-                        rtmpsClient?.sendFlvData(com.screenlive.app.rtmp.RtmpConsts.AUDIO_MESSAGE, flvTag, timestamp)
-                        totalBytesSent += flvTag.size
-                    }
-                    
-                    audioFrameCount++
-                    
-                    if (audioFrameCount == 1) {
-                        PtlLogger.i(TAG, "✓ First audio frame @ ${timestamp}ms")
-                    }
-                    
-                    // Update overlay metrics every 30 frames (~1 second)
-                    if (audioFrameCount % 30 == 0) {
-                        updateOverlayMetrics()
-                    }
-                }
-                
-            } catch (e: Exception) {
-                PtlLogger.e(TAG, "Audio encoding error", e)
-                break
-            }
-        }
-        
-        PtlLogger.i(TAG, "Audio encoding loop stopped (frames=$audioFrameCount)")
-    }
+    // [V2] Old encodeAudioLoop removed - audio handled by CleanAudioMixer callback
+    // Audio frames are sent directly in initializeAudioEncoder() via callback:
+    // cleanAudioMixer!!.start { data, isConfig -> /* send FLV */ }
     
     // ==================== Overlay Integration ====================
     
@@ -820,6 +1018,7 @@ class RootEncoderService(
     
     /**
      * [PTL] CRITICAL: Auto-reconnect without stopping encoders (PiP survival)
+     * [FIX] Only reconnect if NOT manual stop - allows recovery from network issues
      * Why: 6-8s disconnect after PiP is often temporary (carrier/WiFi power-save)
      * Strategy: Retry with exponential backoff, keep encoders running during reconnect
      */
@@ -829,7 +1028,7 @@ class RootEncoderService(
         }
         rtmpsDisconnectHandled = true
         
-        PtlLogger.e(TAG, "[PTL] RTMPS lost: ${err?.message ?: "unknown"} — will auto-reconnect")
+        PtlLogger.e(TAG, "[PTL] RTMPS lost: ${err?.message ?: "unknown"} — checking if auto-reconnect allowed")
         Log.e(TAG, "RTMPS connection lost, attempting auto-reconnect...")
         
         // [PTL] DON'T stop encoders immediately - try reconnect first
@@ -838,9 +1037,9 @@ class RootEncoderService(
             val maxAttempts = com.screenlive.app.config.StreamConfig.maxReconnectAttempts
             
             repeat(maxAttempts) { attempt ->
-                // [FIX] Check if user manually stopped stream - abort reconnect
-                if (!isStreaming) {
-                    PtlLogger.i(TAG, "[PTL] Stream manually stopped - aborting reconnect")
+                // [FIX-CRITICAL] Check if user manually stopped stream OR stream already stopped - abort reconnect
+                if (manualStop || !isStreaming) {
+                    PtlLogger.i(TAG, "[PTL] Reconnect aborted (manualStop=$manualStop, isStreaming=$isStreaming)")
                     return@launch
                 }
                 
@@ -858,14 +1057,30 @@ class RootEncoderService(
                 backoffMs = kotlin.math.min(10_000, (backoffMs * 1.7).toLong())
             }
             
-            // [PTL] All reconnect attempts failed - NOW stop encoders
-            PtlLogger.e(TAG, "[PTL] ❌ Reconnect failed after $maxAttempts attempts — stopping stream")
-            cleanup("reconnect failed")
+            // [PTL] All reconnect attempts failed - check manualStop before cleanup
+            if (!manualStop) {
+                PtlLogger.e(TAG, "[PTL] ❌ Reconnect failed after $maxAttempts attempts — stopping stream")
+                val wasManual = prefs.manualStop
+                cleanup("reconnect failed")
+                
+                // [CRASH-RECOVERY] If not manual stop and was streaming → restart activity
+                // to re-request MediaProjection permission
+                if (!wasManual && prefs.wasStreaming) {
+                    PtlLogger.i(TAG, "[RECOVERY] Scheduling activity restart in 1.5s")
+                    RestartHelper.scheduleRestartActivity(activity, 1500L)
+                }
+            } else {
+                PtlLogger.i(TAG, "[PTL] Reconnect failed but manualStop=true → no further action")
+            }
         }
     }
 
     private fun cleanup(reason: String = "unknown") {
         PtlLogger.i(TAG, "[PTL] Cleanup triggered: $reason")
+        
+        // [CRASH-RECOVERY] Check if this is a manual stop
+        val isManual = prefs.manualStop
+        
         isStreaming = false
         isEncoding = false  // [PTL FIX] Reset encoding flag
         
@@ -879,9 +1094,11 @@ class RootEncoderService(
         stopOverlayService()
         
         try {
-            // Cleanup audio capture manager
-            audioCaptureManager?.cleanup()
-            audioCaptureManager = null
+            // [V2] Cleanup CleanAudioMixer (replaces AudioCaptureManager)
+            runCatching {
+                cleanAudioMixer?.cleanup()
+                cleanAudioMixer = null
+            }
             
             // Safe video encoder cleanup
             try { videoEncoder?.stop() } catch (_: IllegalStateException) {}
@@ -905,6 +1122,15 @@ class RootEncoderService(
             Log.e(TAG, "Cleanup error", e)
         }
         rtmpsDisconnectHandled = false
+        
+        // [CRASH-RECOVERY] Only clear wasStreaming if manual stop
+        // Keep it true for crash/reconnect-failed so activity can restart
+        if (isManual) {
+            prefs.wasStreaming = false
+            PtlLogger.i(TAG, "[RECOVERY] Manual cleanup: wasStreaming=false")
+        } else {
+            PtlLogger.i(TAG, "[RECOVERY] Non-manual cleanup: wasStreaming kept true for auto-restart")
+        }
         
         // [PTL] Clean up broadcast receiver to prevent memory leaks
         try {

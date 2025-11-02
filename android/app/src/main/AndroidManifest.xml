@@ -9,6 +9,12 @@
     <!-- Foreground service - BẮT BUỘC để stream ổn định -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     
+    <!-- SCHEDULE_EXACT_ALARM - BẮT BUỘC cho crash recovery restart -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    
+    <!-- RECEIVE_BOOT_COMPLETED - BẮT BUỘC cho reboot recovery -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    
     <!-- BẮT BUỘC từ Android 14 khi dùng MediaProjection -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     
@@ -33,7 +39,7 @@
 
     <application
         android:label="ScreenLive"
-        android:name="${applicationName}"
+        android:name=".App"
         android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="false">  <!-- [PTL] RTMPS only, no cleartext -->
         
@@ -64,14 +70,26 @@
             android:name=".ScreenCaptureService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection|microphone" />
+            android:foregroundServiceType="mediaProjection|microphone"
+            android:stopWithTask="false" />
         
         <!-- [PTL] Foreground service for floating overlay -->
         <service
             android:name=".overlay.OverlayService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection|microphone" />
+            android:foregroundServiceType="mediaProjection|microphone"
+            android:stopWithTask="false" />
+        
+        <!-- [CRASH-RECOVERY] Receiver to restart stream after device reboot -->
+        <receiver
+            android:name=".BootCompletedReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
         
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->

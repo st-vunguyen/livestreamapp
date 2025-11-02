@@ -7,10 +7,13 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
+import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
 import android.util.Log
 import androidx.core.content.ContextCompat
 import android.app.PictureInPictureParams
-import android.os.Build
 import android.util.Rational
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -174,6 +177,10 @@ class MainActivity: FlutterActivity() {
                         val status = permissionsHelper?.getPermissionStatus() ?: emptyMap()
                         result.success(status)
                     }
+                    "checkBatteryOptimization" -> {
+                        checkAndRequestBatteryOptimization()
+                        result.success(null)
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -187,6 +194,9 @@ class MainActivity: FlutterActivity() {
         // Link handlers
         captureHandler?.setMetricsHandler(metricsHandler)
         publishHandler?.setMetricsHandler(metricsHandler)
+        
+        // [FIX] Check battery optimization on startup to prevent 5-min OEM kill
+        checkAndRequestBatteryOptimization()
         
         // Request permissions on app start
         android.util.Log.d("MainActivity", "Requesting initial permissions")
@@ -237,6 +247,42 @@ class MainActivity: FlutterActivity() {
             REQUEST_CODE_AUDIO -> {
                 android.util.Log.d("MainActivity", "Audio permission result: $resultCode")
                 // Audio permission is handled by Android system callback
+            }
+        }
+    }
+
+    /**
+     * [FIX] Check and request battery optimization whitelist to prevent OEM killing FGS
+     * Critical for Meizu/Flyme, Xiaomi/MIUI, Oppo/ColorOS which aggressively kill background apps
+     */
+    private fun checkAndRequestBatteryOptimization() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            val packageName = packageName
+            
+            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                Log.w("MainActivity", "[FIX] App NOT whitelisted from battery optimization - requesting...")
+                Log.w("MainActivity", "[FIX] Without this, Meizu/MIUI will kill FGS after ~5 minutes")
+                
+                try {
+                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    startActivity(intent)
+                    Log.i("MainActivity", "[FIX] Battery optimization whitelist dialog shown")
+                } catch (e: Exception) {
+                    Log.e("MainActivity", "[FIX] Failed to request battery whitelist: ${e.message}")
+                    // Fallback: Open battery settings
+                    try {
+                        val settingsIntent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                        startActivity(settingsIntent)
+                        Log.i("MainActivity", "[FIX] Opened battery optimization settings (manual whitelist)")
+                    } catch (e2: Exception) {
+                        Log.e("MainActivity", "[FIX] Cannot open battery settings: ${e2.message}")
+                    }
+                }
+            } else {
+                Log.i("MainActivity", "[FIX] ✓ App already whitelisted from battery optimization")
             }
         }
     }

@@ -31,15 +31,15 @@ class ScreenCaptureService : Service() {
         
         // [PTL] Acquire WakeLock to prevent CPU sleep during streaming
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "screenlive:wakelock").apply {
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SLive:Wake").apply {
             setReferenceCounted(false)
             acquire()
             android.util.Log.i(TAG, "[PTL] ✓ WakeLock acquired (prevent CPU sleep during PiP)")
         }
         
-        // [PTL] Acquire WifiLock to prevent WiFi power-save mode
+        // [PTL] Acquire HIGH_PERF WifiLock to prevent WiFi power-save mode
         val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "screenlive:wifilock").apply {
+        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "SLive:Wifi").apply {
             setReferenceCounted(false)
             acquire()
             android.util.Log.i(TAG, "[PTL] ✓ WifiLock acquired (HIGH_PERF mode, prevent 6-8s disconnect)")
@@ -56,7 +56,12 @@ class ScreenCaptureService : Service() {
         val type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or 
                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
         
-        startForeground(NOTIFICATION_ID, notification, type)
+        // [FIX] Use FOREGROUND_SERVICE_IMMEDIATE for Android 14+ to prevent aggressive kill
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(NOTIFICATION_ID, notification, type)
+        } else {
+            startForeground(NOTIFICATION_ID, notification, type)
+        }
         
         android.util.Log.i(TAG, "✅ FGS active with correct type - ready for MediaProjection")
         
@@ -76,16 +81,43 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+    
+    /**
+     * [FIX-CRITICAL] Called when task is removed from Recent Apps
+     * Do NOT stopSelf() here - instead restart service to keep stream alive
+     * This prevents OEM (Meizu/Flyme) from killing service when user swipes app away
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        android.util.Log.i(TAG, "[FIX] Task removed from Recent Apps")
+        
+        // [CRASH-RECOVERY] Check persistent prefs (not just volatile flags)
+        val prefs = Prefs(this)
+        val manualStop = prefs.manualStop
+        val wasStreaming = prefs.wasStreaming
+        
+        if (manualStop || !wasStreaming) {
+            android.util.Log.i(TAG, "[RECOVERY] Not restarting (manualStop=$manualStop, wasStreaming=$wasStreaming)")
+            super.onTaskRemoved(rootIntent)
+            return
+        }
+        
+        android.util.Log.i(TAG, "[RECOVERY] Auto-restarting service to maintain stream")
+        RestartHelper.scheduleRestartService(this, 1000L)
+        
+        super.onTaskRemoved(rootIntent)
+    }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
                 CHANNEL_NAME,
-                NotificationManager.IMPORTANCE_LOW
+                NotificationManager.IMPORTANCE_HIGH  // [FIX] HIGH để tránh bị Doze kill
             ).apply {
-                description = "Screen capture notification"
+                description = "Screen capture notification - Keep app alive during streaming"
                 setShowBadge(false)
+                enableVibration(false)
+                setSound(null, null)
             }
             
             val notificationManager = getSystemService(NotificationManager::class.java)
@@ -102,13 +134,22 @@ class ScreenCaptureService : Service() {
             PendingIntent.FLAG_IMMUTABLE
         )
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Screen Live")
-            .setContentText("Screen capture is active")
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("🔴 Screen Live - Streaming")
+            .setContentText("Tap to return to app • Stream active")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setContentIntent(pendingIntent)
-            .setOngoing(true)
-            .build()
+            .setOngoing(true)  // [FIX] Cannot be dismissed - prevent accidental kill
+            .setPriority(NotificationCompat.PRIORITY_HIGH)  // Keep visible
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+        
+        // [FIX] Android 12+ - Set ForegroundServiceBehavior to IMMEDIATE
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            builder.setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+        }
+        
+        return builder.build()
     }
     
     override fun onDestroy() {
