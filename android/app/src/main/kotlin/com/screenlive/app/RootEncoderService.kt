@@ -46,9 +46,11 @@ class RootEncoderService(
         private const val VIDEO_BITRATE = 6_000_000  // 6 Mbps (YouTube recommended 4.5-7.5 Mbps for 720p60)
         private const val VIDEO_IFRAME_INTERVAL = 2  // 2 seconds (GOP = 120 frames @ 60fps)
         
-        private const val AUDIO_SAMPLE_RATE = 48000
-        private const val AUDIO_BITRATE = 160_000  // 160 kbps (increased from 128)
-        private const val AUDIO_CHANNELS = 1  // Mono for MVP
+        // Audio: 48kHz Stereo 160kbps (hardware native, no resample)
+        private const val AUDIO_SAMPLE_RATE = 48000  // 48kHz (hardware std)
+        private const val AUDIO_BITRATE = 160_000    // 160 kbps AAC-LC
+        private const val AUDIO_CHANNELS = 2         // Stereo
+        private const val AUDIO_CHANNEL_MASK = AudioFormat.CHANNEL_IN_STEREO
         
         const val REQUEST_CODE_PROJECTION = 1001
     }
@@ -71,9 +73,9 @@ class RootEncoderService(
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var videoEncoder: MediaCodec? = null
-    private var audioEncoder: MediaCodec? = null
-    private var audioRecord: AudioRecord? = null
-    private var audioBufferSize: Int = 0 // [PTL] Store audio buffer size for encoding loop
+    
+    // Audio capture manager (mic + internal) - internal for overlay access
+    internal var audioCaptureManager: AudioCaptureManager? = null
     
     private var flvMuxer: MinimalFlvMuxer? = null
     private var rtmpsClient: com.screenlive.app.rtmp.MinimalRtmpsClient? = null
@@ -82,6 +84,7 @@ class RootEncoderService(
     @Volatile private var isEncoding = false  // [PTL FIX] Track if encoding loops are already running
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var encodingJob: Job? = null
+    private var reconnectJob: Job? = null  // [FIX] Track reconnect coroutine to cancel on manual stop
 
     @Volatile private var rtmpsDisconnectHandled = false
     
@@ -168,6 +171,22 @@ class RootEncoderService(
     fun cleanupAll() {
         cleanup()
     }
+    
+    // [PTL] Audio control methods for overlay
+    fun toggleMic(): Boolean {
+        val result = audioCaptureManager?.toggleMic() ?: false
+        Log.i(TAG, "[PTL] RootEncoderService.toggleMic() -> $result")
+        return result
+    }
+    
+    fun toggleGameAudio(): Boolean {
+        val result = audioCaptureManager?.toggleGameAudio() ?: false
+        Log.i(TAG, "[PTL] RootEncoderService.toggleGameAudio() -> $result")
+        return result
+    }
+    
+    fun isMicEnabled(): Boolean = audioCaptureManager?.isMicEnabled ?: true
+    fun isGameAudioEnabled(): Boolean = audioCaptureManager?.isGameAudioEnabled ?: true
     
     private fun start(call: MethodCall, result: MethodChannel.Result) {
         try {
@@ -415,7 +434,7 @@ class RootEncoderService(
             PtlLogger.i(TAG, "[PTL] PUBLISH ACK – starting encoder pipeline")
             
             // Ensure encoders are ready
-            if (videoEncoder == null || audioEncoder == null) {
+            if (videoEncoder == null || audioCaptureManager == null) {
                 PtlLogger.e(TAG, "❌ Encoders not initialized!")
                 withContext(Dispatchers.Main) {
                     pendingResult?.error("ENCODER_ERROR", "Encoders not initialized", null)
@@ -551,44 +570,18 @@ class RootEncoderService(
     }
     
     private fun initializeAudioEncoder() {
-        Log.d(TAG, "Initializing audio encoder...")
+        Log.d(TAG, "Initializing audio encoder (48kHz stereo AAC-LC 160kbps)...")
         
-        // TODO: Audio Playback Capture (Android 10+)
-        // For MVP: Use microphone
+        // Use AudioCaptureManager for mic + internal audio (pass activity context)
+        audioCaptureManager = AudioCaptureManager(activity, mediaProjection)
         
-        val format = MediaFormat.createAudioFormat(
-            MediaFormat.MIMETYPE_AUDIO_AAC,
-            AUDIO_SAMPLE_RATE,
-            AUDIO_CHANNELS
-        ).apply {
-            setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
-            setInteger(MediaFormat.KEY_BIT_RATE, AUDIO_BITRATE)
-            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 8192) // [PTL FIX] Ensure sufficient input buffer
+        if (!audioCaptureManager!!.initialize()) {
+            throw IOException("Failed to initialize audio capture")
         }
         
-        audioEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC).apply {
-            configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            start()
-        }
+        audioCaptureManager!!.start()
         
-        // Initialize AudioRecord
-        audioBufferSize = AudioRecord.getMinBufferSize(
-            AUDIO_SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT
-        )
-        
-        audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
-            AUDIO_SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-            audioBufferSize
-        ).apply {
-            startRecording()
-        }
-        
-        Log.i(TAG, "✓ Audio encoder started (microphone, bufferSize=$audioBufferSize)")
+        Log.i(TAG, "✓ Audio capture started (mic + internal if Android 10+)")
     }
     
     private fun initializeFlvMuxer() {
@@ -704,84 +697,54 @@ class RootEncoderService(
     }
     
     private fun encodeAudioLoop() {
-        val bufferInfo = MediaCodec.BufferInfo()
-        // [PTL FIX] Use actual audio buffer size, not hardcoded 4096
-        val pcmBuffer = ByteArray(maxOf(audioBufferSize, 4096))
         var startTime = System.currentTimeMillis()
         var audioFrameCount = 0
         
-        PtlLogger.i(TAG, "Audio encoding loop started (bufferSize=${pcmBuffer.size})")
+        PtlLogger.i(TAG, "Audio encoding loop started (48kHz stereo AAC-LC 160kbps)")
         
         while (isStreaming) {
             try {
-                // Read PCM from AudioRecord
-                val read = audioRecord?.read(pcmBuffer, 0, pcmBuffer.size) ?: 0
-                if (read > 0) {
-                    // Feed to encoder
-                    val inputIndex = audioEncoder?.dequeueInputBuffer(10_000) ?: continue
-                    if (inputIndex >= 0) {
-                        val inputBuffer = audioEncoder?.getInputBuffer(inputIndex)
-                        if (inputBuffer != null) {
-                            inputBuffer.clear()
-                            // [PTL FIX] Only put data that fits in the input buffer
-                            val bytesToWrite = minOf(read, inputBuffer.remaining())
-                            if (bytesToWrite < read) {
-                                PtlLogger.w(TAG, "Audio buffer truncated: read=$read, capacity=${inputBuffer.remaining()}")
-                            }
-                            inputBuffer.put(pcmBuffer, 0, bytesToWrite)
-                            audioEncoder?.queueInputBuffer(inputIndex, 0, bytesToWrite, System.nanoTime() / 1000, 0)
-                        }
-                    }
+                // Capture and encode one frame (mic + internal mixed)
+                val frame = audioCaptureManager?.captureAndEncode()
+                
+                if (frame == null) {
+                    Thread.sleep(5) // Small delay if no data
+                    continue
                 }
                 
-                // Get encoded AAC
-                val outputIndex = audioEncoder?.dequeueOutputBuffer(bufferInfo, 0) ?: continue
-                if (outputIndex >= 0) {
-                    val outputBuffer = audioEncoder?.getOutputBuffer(outputIndex) ?: continue
-                    
-                    // PTL FIX: Handle AAC config separately
-                    if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                        // This is AudioSpecificConfig
-                        PtlLogger.i(TAG, "Audio: Received CODEC_CONFIG flag (size=${bufferInfo.size})")
-                        if (!audioConfigSent && bufferInfo.size > 0) {
-                            val configData = ByteArray(bufferInfo.size)
-                            outputBuffer.get(configData)
-                            
-                            val configTag = flvMuxer?.createAudioConfigTag(configData, 0)
-                            if (configTag != null) {
-                                rtmpsClient?.sendFlvData(com.screenlive.app.rtmp.RtmpConsts.AUDIO_MESSAGE, configTag)
-                                totalBytesSent += configTag.size
-                                audioConfigSent = true
-                                PtlLogger.i(TAG, "✓ Sent AAC config (AudioSpecificConfig) - ${configData.size} bytes → totalSent=$totalBytesSent")
-                            } else {
-                                PtlLogger.w(TAG, "⚠️ Failed to create audio config FLV tag!")
-                            }
-                        }
-                    } else if (bufferInfo.size > 0) {
-                        // Regular AAC frames
-                        val data = ByteArray(bufferInfo.size)
-                        outputBuffer.get(data)
-                        
-                        val timestamp = (System.currentTimeMillis() - startTime).toInt()
-                        val flvTag = flvMuxer?.createAudioTag(data, timestamp)
-                        if (flvTag != null) {
-                            rtmpsClient?.sendFlvData(com.screenlive.app.rtmp.RtmpConsts.AUDIO_MESSAGE, flvTag, timestamp)
-                            totalBytesSent += flvTag.size
-                        }
-                        
-                        audioFrameCount++
-                        
-                        if (audioFrameCount == 1) {
-                            PtlLogger.i(TAG, "✓ First audio frame @ ${timestamp}ms")
-                        }
-                        
-                        // [PTL] Update overlay metrics every 30 frames (~1 second at 30fps audio)
-                        if (audioFrameCount % 30 == 0) {
-                            updateOverlayMetrics()
-                        }
+                // Handle ASC (AudioSpecificConfig) - send once before first frame
+                if (frame.isConfig && !audioConfigSent) {
+                    val configTag = flvMuxer?.createAudioConfigTag(frame.data, 0)
+                    if (configTag != null) {
+                        rtmpsClient?.sendFlvData(com.screenlive.app.rtmp.RtmpConsts.AUDIO_MESSAGE, configTag)
+                        totalBytesSent += configTag.size
+                        audioConfigSent = true
+                        PtlLogger.i(TAG, "✓ Sent ASC (AudioSpecificConfig) ${frame.data.size}B → totalSent=$totalBytesSent")
+                    } else {
+                        PtlLogger.w(TAG, "⚠️ Failed to create audio config FLV tag!")
+                    }
+                    continue
+                }
+                
+                // Handle regular AAC frames
+                if (!frame.isConfig && frame.data.isNotEmpty()) {
+                    val timestamp = (System.currentTimeMillis() - startTime).toInt()
+                    val flvTag = flvMuxer?.createAudioTag(frame.data, timestamp)
+                    if (flvTag != null) {
+                        rtmpsClient?.sendFlvData(com.screenlive.app.rtmp.RtmpConsts.AUDIO_MESSAGE, flvTag, timestamp)
+                        totalBytesSent += flvTag.size
                     }
                     
-                    audioEncoder?.releaseOutputBuffer(outputIndex, false)
+                    audioFrameCount++
+                    
+                    if (audioFrameCount == 1) {
+                        PtlLogger.i(TAG, "✓ First audio frame @ ${timestamp}ms")
+                    }
+                    
+                    // Update overlay metrics every 30 frames (~1 second)
+                    if (audioFrameCount % 30 == 0) {
+                        updateOverlayMetrics()
+                    }
                 }
                 
             } catch (e: Exception) {
@@ -870,11 +833,17 @@ class RootEncoderService(
         Log.e(TAG, "RTMPS connection lost, attempting auto-reconnect...")
         
         // [PTL] DON'T stop encoders immediately - try reconnect first
-        scope.launch {
+        reconnectJob = scope.launch {
             var backoffMs = 500L
             val maxAttempts = com.screenlive.app.config.StreamConfig.maxReconnectAttempts
             
             repeat(maxAttempts) { attempt ->
+                // [FIX] Check if user manually stopped stream - abort reconnect
+                if (!isStreaming) {
+                    PtlLogger.i(TAG, "[PTL] Stream manually stopped - aborting reconnect")
+                    return@launch
+                }
+                
                 delay(backoffMs)
                 PtlLogger.i(TAG, "[PTL] Reconnect attempt ${attempt + 1}/$maxAttempts (backoff=${backoffMs}ms)")
                 
@@ -899,21 +868,20 @@ class RootEncoderService(
         PtlLogger.i(TAG, "[PTL] Cleanup triggered: $reason")
         isStreaming = false
         isEncoding = false  // [PTL FIX] Reset encoding flag
+        
+        // [FIX] Cancel reconnect job immediately to prevent reconnect after manual stop
+        reconnectJob?.cancel()
+        reconnectJob = null
+        
         encodingJob?.cancel()
         
         // [PTL] Stop overlay service
         stopOverlayService()
         
         try {
-            // Safe audio cleanup
-            try { audioRecord?.stop() } catch (_: IllegalStateException) {}
-            try { audioRecord?.release() } catch (_: Exception) {}
-            audioRecord = null
-            
-            // Safe audio encoder cleanup  
-            try { audioEncoder?.stop() } catch (_: IllegalStateException) {}
-            try { audioEncoder?.release() } catch (_: Exception) {}
-            audioEncoder = null
+            // Cleanup audio capture manager
+            audioCaptureManager?.cleanup()
+            audioCaptureManager = null
             
             // Safe video encoder cleanup
             try { videoEncoder?.stop() } catch (_: IllegalStateException) {}

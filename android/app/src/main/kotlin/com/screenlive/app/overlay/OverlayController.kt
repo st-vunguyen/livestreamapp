@@ -161,13 +161,67 @@ object OverlayController {
 
     @SuppressLint("ClickableViewAccessibility")
     private fun createMiniView(): View {
-        val container = FrameLayout(appContext!!)
-        container.layoutParams = FrameLayout.LayoutParams(dp(24), dp(24))
+        val container = LinearLayout(appContext!!)
+        container.orientation = LinearLayout.HORIZONTAL
+        // GIẢM SIZE 2/3: từ 116x40 → 77x27dp (2/3 của kích thước cũ)
+        container.layoutParams = LinearLayout.LayoutParams(dp(77), dp(27))
+        container.setBackgroundColor(android.graphics.Color.parseColor("#80000000")) // Semi-transparent background
+        container.setPadding(dp(2), dp(2), dp(2), dp(2))
+        container.gravity = Gravity.CENTER_VERTICAL
+        
+        // MIC button (21x21dp - 2/3 của 32dp)
+        val micButton = TextView(appContext!!)
+        micButton.id = View.generateViewId()
+        micButton.text = "🎤" // Mic emoji
+        micButton.textSize = 12f // giảm từ 18f
+        micButton.gravity = Gravity.CENTER
+        micButton.setBackgroundColor(android.graphics.Color.parseColor("#4CAF50")) // Green = ON
+        micButton.layoutParams = LinearLayout.LayoutParams(dp(21), dp(21))
+        micButton.setOnClickListener {
+            val newState = com.screenlive.app.MainActivity.toggleMicFromOverlay()
+            Log.i(TAG, "[PTL] Mic button clicked, new state: $newState")
+            micButton.setBackgroundColor(
+                if (newState) android.graphics.Color.parseColor("#4CAF50") // Green ON
+                else android.graphics.Color.parseColor("#757575") // Gray OFF
+            )
+            // Reset fade timer khi tương tác
+            kickAutoFade()
+        }
+        container.addView(micButton)
+        
+        // SOUND button (21x21dp - 2/3 của 32dp)
+        val soundButton = TextView(appContext!!)
+        soundButton.id = View.generateViewId()
+        soundButton.text = "🔊" // Speaker emoji
+        soundButton.textSize = 12f // giảm từ 18f
+        soundButton.gravity = Gravity.CENTER
+        soundButton.setBackgroundColor(android.graphics.Color.parseColor("#4CAF50")) // Green = ON
+        val soundParams = LinearLayout.LayoutParams(dp(21), dp(21))
+        soundParams.marginStart = dp(3)
+        soundButton.layoutParams = soundParams
+        soundButton.setOnClickListener {
+            val newState = com.screenlive.app.MainActivity.toggleGameAudioFromOverlay()
+            Log.i(TAG, "[PTL] Sound button clicked, new state: $newState")
+            soundButton.setBackgroundColor(
+                if (newState) android.graphics.Color.parseColor("#4CAF50") // Green ON
+                else android.graphics.Color.parseColor("#757575") // Gray OFF
+            )
+            // Reset fade timer khi tương tác
+            kickAutoFade()
+        }
+        container.addView(soundButton)
+        
+        // Red dot (drag handle) - 8x8dp (2/3 của 12dp)
+        val dotContainer = FrameLayout(appContext!!)
+        val dotParams = LinearLayout.LayoutParams(dp(21), dp(21))
+        dotParams.marginStart = dp(3)
+        dotContainer.layoutParams = dotParams
         
         val dot = View(appContext!!)
-        dot.layoutParams = FrameLayout.LayoutParams(dp(12), dp(12), Gravity.CENTER)
+        dot.layoutParams = FrameLayout.LayoutParams(dp(8), dp(8), Gravity.CENTER)
         dot.setBackgroundColor(android.graphics.Color.parseColor("#FF3B30"))
-        container.addView(dot)
+        dotContainer.addView(dot)
+        container.addView(dotContainer)
         
         attachTouchHandler(container)
         return container
@@ -223,6 +277,7 @@ object OverlayController {
         var startWinX = 0
         var startWinY = 0
         var isDragging = false
+        var touchStartedOnButton = false
         
         view.setOnTouchListener { _, event ->
             when (event.actionMasked) {
@@ -231,28 +286,66 @@ object OverlayController {
                     startY = event.rawY
                     layoutParams?.let { startWinX = it.x; startWinY = it.y }
                     isDragging = false
+                    
+                    // Check if touch started on a button (MIC or SOUND)
+                    touchStartedOnButton = false
+                    if (view is ViewGroup) {
+                        for (i in 0 until view.childCount) {
+                            val child = view.getChildAt(i)
+                            if (child is TextView && (child.text == "🎤" || child.text == "🔊")) {
+                                val location = IntArray(2)
+                                child.getLocationOnScreen(location)
+                                val x = event.rawX.toInt()
+                                val y = event.rawY.toInt()
+                                if (x >= location[0] && x <= location[0] + child.width &&
+                                    y >= location[1] && y <= location[1] + child.height) {
+                                    touchStartedOnButton = true
+                                    break
+                                }
+                            }
+                        }
+                    }
+                    
                     mainHandler.removeCallbacks(fadeRunnable)
                     view.alpha = 1f
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    val dx = event.rawX - startX
-                    val dy = event.rawY - startY
-                    if (!isDragging && (abs(dx) > DRAG_THRESHOLD_PX || abs(dy) > DRAG_THRESHOLD_PX)) {
-                        isDragging = true
-                    }
-                    if (isDragging) {
-                        layoutParams?.x = (startWinX + dx).toInt()
-                        layoutParams?.y = (startWinY + dy).toInt()
-                        windowManager?.updateViewLayout(view, layoutParams)
+                    // Only drag if not on button
+                    if (!touchStartedOnButton) {
+                        val dx = event.rawX - startX
+                        val dy = event.rawY - startY
+                        if (!isDragging && (abs(dx) > DRAG_THRESHOLD_PX || abs(dy) > DRAG_THRESHOLD_PX)) {
+                            isDragging = true
+                        }
+                        if (isDragging) {
+                            layoutParams?.x = (startWinX + dx).toInt()
+                            layoutParams?.y = (startWinY + dy).toInt()
+                            windowManager?.updateViewLayout(view, layoutParams)
+                        }
                     }
                     true
                 }
                 MotionEvent.ACTION_UP -> {
-                    if (!isDragging) {
-                        // Show confirmation dialog
-                        Log.i(TAG, "[PTL] Overlay: user tapped - showing stop confirmation")
-                        showStopConfirmationDialog()
+                    // Show stop dialog only if tapped on red dot (not dragging, not on buttons)
+                    if (!isDragging && !touchStartedOnButton) {
+                        // Check if tap was on red dot area (rightmost part of mini view)
+                        if (view is ViewGroup && view.childCount >= 3) {
+                            val redDotContainer = view.getChildAt(2) // Third child is red dot container
+                            val location = IntArray(2)
+                            redDotContainer.getLocationOnScreen(location)
+                            val x = event.rawX.toInt()
+                            val y = event.rawY.toInt()
+                            if (x >= location[0] && x <= location[0] + redDotContainer.width &&
+                                y >= location[1] && y <= location[1] + redDotContainer.height) {
+                                Log.i(TAG, "[PTL] Overlay: red dot tapped - showing stop confirmation")
+                                showStopConfirmationDialog()
+                            }
+                        } else {
+                            // For non-mini views (compact, expanded), show dialog on any tap
+                            Log.i(TAG, "[PTL] Overlay: user tapped - showing stop confirmation")
+                            showStopConfirmationDialog()
+                        }
                     }
                     kickAutoFade()
                     true

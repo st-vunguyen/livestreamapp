@@ -70,6 +70,39 @@ class MainActivity: FlutterActivity() {
                 } ?: android.util.Log.w("MainActivity", "[PTL] RootEncoderService is null")
             } ?: android.util.Log.w("MainActivity", "[PTL] MainActivity instance is null")
         }
+        
+        // [PTL] Audio control methods for overlay buttons
+        fun toggleMicFromOverlay(): Boolean {
+            currentInstance?.let { activity ->
+                activity.rootEncoderService?.let { service ->
+                    val result = service.toggleMic()
+                    android.util.Log.i("MainActivity", "[PTL] toggleMicFromOverlay -> $result")
+                    return result
+                }
+            }
+            android.util.Log.w("MainActivity", "[PTL] toggleMicFromOverlay: instance or service is null")
+            return false
+        }
+        
+        fun toggleGameAudioFromOverlay(): Boolean {
+            currentInstance?.let { activity ->
+                activity.rootEncoderService?.let { service ->
+                    val result = service.toggleGameAudio()
+                    android.util.Log.i("MainActivity", "[PTL] toggleGameAudioFromOverlay -> $result")
+                    return result
+                }
+            }
+            android.util.Log.w("MainActivity", "[PTL] toggleGameAudioFromOverlay: instance or service is null")
+            return false
+        }
+        
+        fun isMicEnabledFromOverlay(): Boolean {
+            return currentInstance?.rootEncoderService?.isMicEnabled() ?: true
+        }
+        
+        fun isGameAudioEnabledFromOverlay(): Boolean {
+            return currentInstance?.rootEncoderService?.isGameAudioEnabled() ?: true
+        }
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
