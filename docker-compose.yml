@@ -1,0 +1,9 @@
+version: '3'
+services:
+  rtmp:
+    image: alfg/nginx-rtmp
+    ports:
+      - "1935:1935"  # RTMP
+      - "8080:80"    # Web status page
+    volumes:
+      - ./rtmp-data:/tmp/hls

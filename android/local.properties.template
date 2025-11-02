@@ -1,0 +1,15 @@
+## This file must *NOT* be checked into Version Control Systems,
+# as it contains information specific to your local configuration.
+#
+# Location of the Flutter SDK. This is set automatically by the Flutter SDK.
+# To set it manually, use the format:
+# flutter.sdk=/path/to/flutter/sdk
+#
+# Example:
+# flutter.sdk=/Users/username/development/flutter
+
+# TODO: Update with your Flutter SDK path
+# flutter.sdk=
+
+# Android SDK location (optional, usually auto-detected)
+# sdk.dir=/path/to/android/sdk
